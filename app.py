@@ -470,33 +470,49 @@ class DBManager:
             # st.error(f"Error loading matchups: {e}") # Silent fail or log
             return []
 
-    def add_matchup(self, hero_name, lane, opponent_name, win_rate, version_name):
+    def add_matchup(self, hero_name, lane, opponent_name, enemy_lane, win_rate, version_name):
         """
         Adds a bi-directional matchup to the 'matchups' sheet for a specific version.
+        Now supports enemy_lane.
         """
         try:
             try:
                 df = self.conn.read(worksheet="matchups")
             except:
                 # Create empty DF if sheet doesn't exist
-                df = pd.DataFrame(columns=['hero', 'lane', 'opponent', 'win_rate', 'version'])
+                df = pd.DataFrame(columns=['hero', 'lane', 'opponent', 'enemy_lane', 'win_rate', 'version'])
 
             # Ensure columns
-            required_cols = ['hero', 'lane', 'opponent', 'win_rate', 'version']
+            required_cols = ['hero', 'lane', 'opponent', 'enemy_lane', 'win_rate', 'version']
             for col in required_cols:
                 if col not in df.columns:
                     df[col] = "" # Add missing cols
 
             # Prepare new rows
-            row1 = {"hero": hero_name, "lane": lane, "opponent": opponent_name, "win_rate": win_rate, "version": version_name}
+            # Row 1: Hero vs Opponent
+            row1 = {
+                "hero": hero_name, 
+                "lane": lane, 
+                "opponent": opponent_name, 
+                "enemy_lane": enemy_lane,
+                "win_rate": win_rate, 
+                "version": version_name
+            }
             
-            # Reverse logic
+            # Row 2: Opponent vs Hero (Reverse)
             rev_wr = 100 - int(win_rate)
-            row2 = {"hero": opponent_name, "lane": lane, "opponent": hero_name, "win_rate": rev_wr, "version": version_name}
+            row2 = {
+                "hero": opponent_name, 
+                "lane": enemy_lane, # Enemy's lane is my enemy_lane
+                "opponent": hero_name, 
+                "enemy_lane": lane, # Enemy's enemy lane is my lane
+                "win_rate": rev_wr, 
+                "version": version_name
+            }
             
             # DELETE collisions first (Update behavior) for THIS VERSION
             c1 = (df['hero'] == hero_name) & (df['opponent'] == opponent_name) & (df['lane'] == lane) & (df['version'] == version_name)
-            c2 = (df['hero'] == opponent_name) & (df['opponent'] == hero_name) & (df['lane'] == lane) & (df['version'] == version_name)
+            c2 = (df['hero'] == opponent_name) & (df['opponent'] == hero_name) & (df['lane'] == enemy_lane) & (df['version'] == version_name)
             
             df = df[~(c1 | c2)]
             
@@ -510,6 +526,45 @@ class DBManager:
         except Exception as e:
             st.error(f"Error adding matchup: {e}")
             return False
+
+    def update_matchup_win_rate(self, hero_name, lane, opponent_name, enemy_lane, new_win_rate, version_name):
+        try:
+            try:
+                df = self.conn.read(worksheet="matchups")
+            except:
+                return False, "Matchups sheet not found."
+            
+            if df.empty: return False, "No matchups found."
+
+            # Indices for Row A
+            mask_a = (df['hero'] == hero_name) & (df['opponent'] == opponent_name) & \
+                     (df['lane'] == lane) & (df['enemy_lane'] == enemy_lane) & \
+                     (df['version'] == version_name)
+            
+            # Indices for Row B (Mirror)
+            mask_b = (df['hero'] == opponent_name) & (df['opponent'] == hero_name) & \
+                     (df['lane'] == enemy_lane) & (df['enemy_lane'] == lane) & \
+                     (df['version'] == version_name)
+            
+            # Update A
+            found = False
+            if mask_a.any():
+                df.loc[mask_a, 'win_rate'] = new_win_rate
+                found = True
+            
+            if not found:
+                return False, "Original matchup not found."
+            
+            # Update B (if exists)
+            if mask_b.any():
+                df.loc[mask_b, 'win_rate'] = 100 - int(new_win_rate)
+            
+            self.conn.update(worksheet="matchups", data=df)
+            st.cache_data.clear()
+            return True, f"Updated: {hero_name} {new_win_rate}% / {opponent_name} {100-int(new_win_rate)}%"
+        except Exception as e:
+            # st.error(f"Error updating matchup: {e}")
+            return False, str(e)
 
     def delete_matchup(self, hero_name, lane, opponent_name, version_name):
         """
@@ -847,109 +902,187 @@ def render_hero_editor_ui():
         elif not isinstance(current_counters, list):
             current_counters = []
 
-        h_counters = st.multiselect("Weak Against", all_hero_names, default=[c for c in current_counters if c in all_hero_names])
+        # --- Counter-Pick Filter Logic ---
+        # 1. Get Unique Positions
+        all_pos_filter = set()
+        if not current_heroes_df.empty and 'position' in current_heroes_df.columns:
+            for pos_entry in current_heroes_df['position']:
+                if isinstance(pos_entry, list):
+                    all_pos_filter.update(pos_entry)
+                elif isinstance(pos_entry, str):
+                    all_pos_filter.add(pos_entry)
+        
+        sorted_pos = sorted(list(all_pos_filter))
+        
+        # 2. Filter Widget
+        filter_val = st.radio("Filter Options by Position:", ["All"] + sorted_pos, horizontal=True, key="filter_cp")
+        
+        # 3. Filter Options
+        if filter_val == "All":
+             filtered_opts = all_hero_names
+        else:
+             # Find heroes with selected position
+             mask = current_heroes_df['position'].apply(lambda x: filter_val in x if isinstance(x, list) else filter_val in str(x))
+             filtered_opts = sorted(current_heroes_df[mask]['name'].unique().tolist())
+        
+        # Merge with current selections to prevent errors (Keep selected even if hidden by filter)
+        final_opts = sorted(list(set(filtered_opts + current_counters)))
+
+        h_counters = st.multiselect("Weak Against", final_opts, default=[c for c in current_counters if c in final_opts])
         
     st.markdown("---")
     
     # --- Lane Matchups ---
     st.subheader("🎯 Lane Matchups")
     
-    # Internal state for matchups (Load from DB)
-    if 'matchups_loaded_for' not in st.session_state or st.session_state['matchups_loaded_for'] != hero.get('name'):
-         st.session_state['temp_matchups'] = db.load_matchups(hero.get('name'), current_version)
-         st.session_state['matchups_loaded_for'] = hero.get('name')
+    # 1. Fetch Real-time Matchups
+    current_matchups = []
+    try:
+        # Load all matchups initially to filter? 
+        # Using db.conn.read for raw access
+        matchups_df = db.conn.read(worksheet="matchups", ttl=0)
+        
+        if not matchups_df.empty and 'hero' in matchups_df.columns:
+            # Filter for current hero
+            mask = matchups_df['hero'] == hero.get('name')
+            current_matchups = matchups_df[mask].to_dict('records')
+    except Exception:
+        current_matchups = []
 
-    # Display List
-    if st.session_state['temp_matchups']:
-        st.caption("Current Matchups:")
-        for idx, m in enumerate(st.session_state['temp_matchups']):
-            c_info, c_edit, c_del = st.columns([5, 1, 1])
+    # 1.5. Lane Filter
+    if current_matchups:
+        # Extract unique lanes
+        unique_lanes = sorted(list(set([m.get('lane', '?') for m in current_matchups])))
+        
+        # UI Widget
+        c_filter_label, c_filter_widget = st.columns([1, 3])
+        # Using st.pills if available, otherwise st.radio
+        if hasattr(st, "pills"):
+            selected_lane = st.pills("Filter by Lane:", ["All"] + unique_lanes, default="All", selection_mode="single")
+        else:
+            selected_lane = st.radio("Filter by Lane:", ["All"] + unique_lanes, horizontal=True)
+            
+        # Filter Logic
+        if selected_lane and selected_lane != "All":
+            current_matchups = [m for m in current_matchups if m.get('lane') == selected_lane]
+
+    # 2. Display Existing Matchups
+    if current_matchups:
+        st.caption(f"Current Matchups ({len(current_matchups)}):")
+        for idx, m in enumerate(current_matchups):
+            # Extract data
+            m_hero = m.get('hero', 'Unknown')
+            lane = m.get('lane', '?')
+            opp = m.get('opponent', '?')
+            e_lane = m.get('enemy_lane', '?')
+            wr = m.get('win_rate', 50)
+            try:
+                wr = int(wr)
+            except:
+                wr = 50
+            ver = m.get('version', '')
+            
+            # Requirement: **{Hero_Name} [{My_Lane}]** vs {Enemy_Hero} ({Enemy_Lane})
+            display_str = f"**{m_hero} [{lane}]** vs {opp} ({e_lane})"
+            
+            # Columns: [0.7, 0.15, 0.15]
+            c_info, c_edit, c_del = st.columns([0.7, 0.15, 0.15])
+            
             with c_info:
-                lane_str = f"[{m.get('lane', 'Any')}]"
-                st.markdown(f"**{lane_str}** vs **{m['opponent']}** : `{m['win_rate']}%`")
+                st.info(f"{display_str} \nWin Rate: {wr}%")
+                
             with c_edit:
-                if st.button("✏️", key=f"edit_m_{idx}"):
-                    st.session_state['edit_matchup_idx'] = idx
-                    st.session_state['edit_lane'] = m.get('lane')
-                    st.session_state['edit_opponent'] = m.get('opponent')
-                    st.session_state['edit_win_rate'] = int(m.get('win_rate', 50))
-                    st.rerun()
+                # Popover for Edit
+                with st.popover("✏️", help="Edit Win Rate", use_container_width=True):
+                    st.markdown(f"**Edit: {m_hero} vs {opp}**")
+                    new_wr = st.slider("Win Rate", 0, 100, wr, key=f"edit_wr_{idx}")
+                    
+                    if st.button("💾", key=f"save_wr_{idx}", type="primary", use_container_width=True):
+                        # Mirror Update System
+                        success, msg = db.update_matchup_win_rate(
+                            m_hero, lane, opp, e_lane, new_wr, ver
+                        )
+                        if success:
+                            st.success("Saved! Updated mirror match as well.")
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+
             with c_del:
-                if st.button("🗑️", key=f"del_m_{idx}"):
-                    # DELETE from DB
-                    if db.delete_matchup(hero.get('name'), m.get('lane'), m.get('opponent'), current_version):
-                        st.success("Deleted!")
-                        st.session_state.pop('matchups_loaded_for', None) # Force reload
+                if st.button("🗑️", key=f"del_db_m_{idx}"):
+                     # Delete Logic
+                    if db.delete_matchup(m_hero, lane, opp, ver):
+                        st.toast("Matchup Deleted", icon="🗑️")
+                        time.sleep(0.5)
                         st.rerun()
+
     else:
-        st.info("No matchups recorded.")
+        st.markdown("*No specific lane matchups found in database.*")
 
-    # Determine Edit Mode
-    edit_idx = st.session_state.get('edit_matchup_idx', None)
-    is_editing = edit_idx is not None
+    # 3. Add New Matchup Form
+    st.markdown("#### ➕ Add New Matchup")
     
-    form_label = f"✏️ แก้ไขข้อมูล (Edit Matchup #{edit_idx+1})" if is_editing else "➕ เพิ่มข้อมูลการชนเลน (Add New Matchup)"
-    btn_label = "Update Matchup" if is_editing else "Confirm Add"
-
-    # Add/Edit Matchup Form (Expander)
-    should_expand = is_editing 
-    
-    with st.expander(form_label, expanded=should_expand):
-        with st.form("add_matchup_form"):
-            ac1, ac2 = st.columns(2)
+    with st.container(border=True):
+        # 4-Column Layout
+        c_m1, c_m2, c_m3, c_m4 = st.columns([1, 1, 1, 1])
+        
+        with c_m1:
+            # Change to Selectbox as requested
+            # Default to current hero
+            default_idx = safe_get_index(all_hero_names, h_name)
+            my_hero_input = st.selectbox("🛡️ My Hero", all_hero_names, index=default_idx, key="add_lm_my_hero")
             
-            # Pre-fill
-            my_positions = h_pos if h_pos else ["Mid", "Roam", "Abyssal", "Dark Slayer", "Jungle"]
-            d_lane = st.session_state.get('edit_lane') if is_editing else None
-            try:
-                lane_ix = my_positions.index(d_lane) if d_lane in my_positions else 0
-            except:
-                lane_ix = 0
+        with c_m2:
+            # Dynamic Filter: Link to 'h_pos' variable from earlier multiselect
+            # Fallback to "All Lanes" if empty
+            my_lane_opts = h_pos if h_pos else ["All Lanes"]
+            # Reset key if needed, or use new key
+            my_lane = st.selectbox("📍 My Lane", my_lane_opts, key="add_lm_my_lane")
             
-            with ac1:
-                new_m_lane = st.selectbox("My Lane", my_positions, index=lane_ix)
-
-            opps = [n for n in all_hero_names if n != hero.get('name')]
-            d_opp = st.session_state.get('edit_opponent') if is_editing else None
-            try:
-                opp_ix = opps.index(d_opp) if d_opp in opps else 0
-            except:
-                opp_ix = 0
+        with c_m3:
+            # Enemy Position Filter
+            filter_enemy_pos = st.radio("Filter Enemy Role:", ["All", "Dark Slayer", "Jungle", "Mid", "Abyssal", "Roam"], horizontal=True, label_visibility="collapsed")
             
-            with ac2:
-                new_m_opp = st.selectbox("Opponent", opps, index=opp_ix)
+            # Apply Filter
+            if filter_enemy_pos == "All":
+                 opp_hero_opts = [h for h in all_hero_names if h != my_hero_input]
+            else:
+                 # Filter based on df
+                 mask = current_heroes_df['position'].apply(lambda x: filter_enemy_pos in x if isinstance(x, list) else filter_enemy_pos in str(x))
+                 filtered_enemies = sorted(current_heroes_df[mask]['name'].unique().tolist())
+                 opp_hero_opts = [h for h in filtered_enemies if h != my_hero_input]
             
-            d_wr = st.session_state.get('edit_win_rate', 50) if is_editing else 50
-            new_m_wr = st.slider("Win Rate %", 0, 100, d_wr)
+            enemy_hero = st.selectbox("⚔️ Enemy Hero", opp_hero_opts, key="add_lm_enemy")
             
-            c_submit, c_cancel = st.columns([1, 1])
-            with c_submit:
-                submitted = st.form_submit_button(btn_label)
-            with c_cancel:
-                canceled = st.form_submit_button("Cancel") 
+        with c_m4:
+            enemy_lane_opts = ["Dark Slayer", "Jungle", "Mid", "Abyssal", "Roam"]
+            enemy_lane = st.selectbox("🎯 Enemy Lane", enemy_lane_opts, key="add_lm_enemy_lane")
             
-            if canceled:
-                st.session_state.pop('edit_matchup_idx', None)
-                st.session_state.pop('edit_lane', None)
-                st.session_state.pop('edit_opponent', None)
-                st.session_state.pop('edit_win_rate', None)
-                st.rerun()
-
-            if submitted:
-                # DB OPERATION
-                # Bi-directional Add/Update
-                if db.add_matchup(hero.get('name'), new_m_lane, new_m_opp, new_m_wr, current_version):
-                     st.success("Matchup Saved!")
-                     # Clear Edit State
-                     st.session_state.pop('edit_matchup_idx', None)
-                     st.session_state.pop('edit_lane', None)
-                     st.session_state.pop('edit_opponent', None)
-                     st.session_state.pop('edit_win_rate', None)
-                     # Force reload to see changes
-                     st.session_state.pop('matchups_loaded_for', None) 
-                     st.rerun()
+        win_rate = st.slider("Predicted Win Rate (%)", 0, 100, 50, key="add_lm_wr")
+        
+        if st.button("Confirm Add", use_container_width=True, type="secondary"):
+            # Use DBManager to add matchup
+            # Arguments: hero_name, lane, opponent_name, enemy_lane, win_rate, version_name
+            
+            with st.spinner("Saving Matchup..."):
+                success = db.add_matchup(
+                    hero_name=my_hero_input,
+                    lane=my_lane,
+                    opponent_name=enemy_hero,
+                    enemy_lane=enemy_lane,
+                    win_rate=win_rate,
+                    version_name=current_version
+                )
+                
+                if success:
+                    # Format: **{Hero_Name} [{My_Lane}]** vs {Enemy_Hero} ({Enemy_Lane})
+                    display_entry = f"**{my_hero_input} [{my_lane}]** vs {enemy_hero} ({enemy_lane})"
+                    st.toast(f"Matchup Added: {display_entry} ({win_rate}%)", icon="✅")
+                    time.sleep(0.5)
+                    st.rerun()
                 else:
-                    st.error("Failed to save matchup.")
+                    st.error("Failed to add matchup.")
 
     st.markdown("---")
     
@@ -989,7 +1122,7 @@ def render_hero_editor_ui():
                 "position": h_pos,
                 "timing": h_timing,
                 "counters": h_counters,
-                # Matchups handled separately now
+                "Lane_Matchups": hero.get('Lane_Matchups', "")
             }
             
             if db.save_hero(updated_data, current_version):
