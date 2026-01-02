@@ -1028,10 +1028,8 @@ def render_hero_editor_ui():
         c_m1, c_m2, c_m3, c_m4 = st.columns([1, 1, 1, 1])
         
         with c_m1:
-            # Change to Selectbox as requested
-            # Default to current hero
-            default_idx = safe_get_index(all_hero_names, h_name)
-            my_hero_input = st.selectbox("🛡️ My Hero", all_hero_names, index=default_idx, key="add_lm_my_hero")
+            # Locked to current hero as requested
+            st.text_input("🛡️ My Hero", value=hero.get('name'), disabled=True, key="add_lm_my_hero_display")
             
         with c_m2:
             # Dynamic Filter: Link to 'h_pos' variable from earlier multiselect
@@ -1045,13 +1043,16 @@ def render_hero_editor_ui():
             filter_enemy_pos = st.radio("Filter Enemy Role:", ["All", "Dark Slayer", "Jungle", "Mid", "Abyssal", "Roam"], horizontal=True, label_visibility="collapsed")
             
             # Apply Filter
+            # Use hero.get('name') directly for exclusion to match logic
+            current_hero_name = hero.get('name')
+            
             if filter_enemy_pos == "All":
-                 opp_hero_opts = [h for h in all_hero_names if h != my_hero_input]
+                 opp_hero_opts = [h for h in all_hero_names if h != current_hero_name]
             else:
                  # Filter based on df
                  mask = current_heroes_df['position'].apply(lambda x: filter_enemy_pos in x if isinstance(x, list) else filter_enemy_pos in str(x))
                  filtered_enemies = sorted(current_heroes_df[mask]['name'].unique().tolist())
-                 opp_hero_opts = [h for h in filtered_enemies if h != my_hero_input]
+                 opp_hero_opts = [h for h in filtered_enemies if h != current_hero_name]
             
             enemy_hero = st.selectbox("⚔️ Enemy Hero", opp_hero_opts, key="add_lm_enemy")
             
@@ -1067,7 +1068,7 @@ def render_hero_editor_ui():
             
             with st.spinner("Saving Matchup..."):
                 success = db.add_matchup(
-                    hero_name=my_hero_input,
+                    hero_name=hero.get('name'), # Use direct data
                     lane=my_lane,
                     opponent_name=enemy_hero,
                     enemy_lane=enemy_lane,
@@ -1077,7 +1078,7 @@ def render_hero_editor_ui():
                 
                 if success:
                     # Format: **{Hero_Name} [{My_Lane}]** vs {Enemy_Hero} ({Enemy_Lane})
-                    display_entry = f"**{my_hero_input} [{my_lane}]** vs {enemy_hero} ({enemy_lane})"
+                    display_entry = f"**{hero.get('name')} [{my_lane}]** vs {enemy_hero} ({enemy_lane})"
                     st.toast(f"Matchup Added: {display_entry} ({win_rate}%)", icon="✅")
                     time.sleep(0.5)
                     st.rerun()
